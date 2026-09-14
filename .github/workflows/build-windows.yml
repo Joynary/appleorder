@@ -1,0 +1,78 @@
+name: Build Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v4
+
+      - name: Checkout upstream source
+        shell: bash
+        run: |
+          git clone --depth 1 https://github.com/suversal/apple-store-inventory-monitor.git upstream
+          cp src-tauri/src/reservation.rs upstream/src-tauri/src/reservation.rs
+
+      - name: Apply browser-assist integration
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('upstream/src-tauri/src/lib.rs')
+          s = p.read_text(encoding='utf-8')
+          s = s.replace('mod chromium_fetcher;\n', 'mod chromium_fetcher;\nmod reservation;\n', 1)
+
+          command = r'''\n#[tauri::command]\nasync fn run_reservation_assist(app: AppHandle, target: Target) -> Result<reservation::ReservationResult, String> {\n    let first = std::env::var("APPLE_RESERVATION_FIRST_NAME").unwrap_or_default();\n    let last = std::env::var("APPLE_RESERVATION_LAST_NAME").unwrap_or_default();\n    let phone = std::env::var("APPLE_RESERVATION_PHONE").unwrap_or_default();\n    let email = std::env::var("APPLE_RESERVATION_EMAIL").unwrap_or_default();\n    if email.trim().is_empty() {\n        return Err("请先设置 APPLE_RESERVATION_EMAIL 环境变量".into());\n    }\n    let product_url = target_purchase_url(&app, &target).ok_or("无法识别目标商品页")?;\n    Ok(reservation::run(&target, &product_url, &first, &last, &phone, &email).await)\n}\n'''
+          marker = '/// 手动测试提醒和首个目标的跳转，便于提前验证实际操作链路。'
+          if 'fn run_reservation_assist' not in s:
+              s = s.replace(marker, command + '\n' + marker, 1)
+
+          trigger = r'''\n            if !std::env::var("APPLE_RESERVATION_EMAIL").unwrap_or_default().trim().is_empty() {\n                let app_for_reservation = app.clone();\n                let target_for_reservation = target.clone();\n                tauri::async_runtime::spawn(async move {\n                    match run_reservation_assist(app_for_reservation.clone(), target_for_reservation).await {\n                        Ok(result) => {\n                            let _ = app_for_reservation.emit(NOTICE_CHANNEL, format!("浏览器辅助结果：{}", result.message));\n                        }\n                        Err(err) => {\n                            let _ = app_for_reservation.emit(NOTICE_CHANNEL, format!("浏览器辅助失败：{err}"));\n                        }\n                    }\n                });\n            }\n'''
+          needle = '            let bark_url = settings.bark_url_for(target).to_owned();\n'
+          if 'APPLE_RESERVATION_EMAIL' not in s[s.find('async fn pump_events'):s.find('fn destination_title')]:
+              s = s.replace(needle, trigger + needle, 1)
+
+          invoke = '            open_target_product,\n'
+          s = s.replace(invoke, invoke + '            run_reservation_assist,\n', 1)
+          p.write_text(s, encoding='utf-8')
+          PY
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: upstream/pnpm-lock.yaml
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+          package_json_file: upstream/package.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install frontend dependencies
+        working-directory: upstream
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Windows bundle
+        working-directory: upstream
+        run: pnpm tauri build
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: apple-store-inventory-monitor-windows
+          path: |
+            upstream/src-tauri/target/release/bundle/msi/*.msi
+            upstream/src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
